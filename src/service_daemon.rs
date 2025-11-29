@@ -5015,4 +5015,142 @@ mod tests {
         mdns_server.shutdown().unwrap();
         mdns_client.shutdown().unwrap();
     }
+
+    #[test]
+    fn test_custom_port_isolation() {
+        // This test verifies:
+        // 1. Daemons on a custom port can communicate with each other
+        // 2. Daemons on different ports are isolated (no cross-talk)
+
+        let service_type = "_custom_port._udp.local.";
+        let instance_custom = "custom_port_instance";
+        let instance_default = "default_port_instance";
+        let host_name = "custom_port_host.local.";
+
+        let service_ip_addr = my_ip_interfaces(false)
+            .iter()
+            .find(|iface| iface.ip().is_ipv4())
+            .map(|iface| iface.ip())
+            .unwrap();
+
+        // Create service info for custom port (5454)
+        let service_custom = ServiceInfo::new(
+            service_type,
+            instance_custom,
+            host_name,
+            service_ip_addr,
+            8080,
+            None,
+        )
+        .unwrap();
+
+        // Create service info for default port (5353)
+        let service_default = ServiceInfo::new(
+            service_type,
+            instance_default,
+            host_name,
+            service_ip_addr,
+            8081,
+            None,
+        )
+        .unwrap();
+
+        // Create two daemons on custom port 5454
+        let custom_port = 5454u16;
+        let server_custom =
+            ServiceDaemon::new_with_port(custom_port).expect("Failed to create custom port server");
+        let client_custom =
+            ServiceDaemon::new_with_port(custom_port).expect("Failed to create custom port client");
+
+        // Create daemon on default port (5353)
+        let server_default = ServiceDaemon::new().expect("Failed to create default port server");
+
+        // Register service on custom port
+        server_custom
+            .register(service_custom.clone())
+            .expect("Failed to register custom port service");
+
+        // Register service on default port
+        server_default
+            .register(service_default.clone())
+            .expect("Failed to register default port service");
+
+        // Browse from custom port client
+        let browse_custom = client_custom
+            .browse(service_type)
+            .expect("Failed to browse on custom port");
+
+        let timeout = Duration::from_secs(3);
+        let mut found_custom = false;
+        let mut found_default_on_custom = false;
+
+        // Custom port client should find the custom port service
+        while let Ok(event) = browse_custom.recv_timeout(timeout) {
+            if let ServiceEvent::ServiceResolved(info) = event {
+                println!(
+                    "Custom port client resolved: {} on port {}",
+                    info.get_fullname(),
+                    info.get_port()
+                );
+                if info.get_fullname().starts_with(instance_custom) {
+                    found_custom = true;
+                    assert_eq!(info.get_port(), 8080);
+                }
+                if info.get_fullname().starts_with(instance_default) {
+                    found_default_on_custom = true;
+                }
+            }
+        }
+
+        assert!(
+            found_custom,
+            "Custom port client should find service on custom port"
+        );
+        assert!(
+            !found_default_on_custom,
+            "Custom port client should NOT find service on default port"
+        );
+
+        // Now verify the default port daemon can find its own services
+        // but not the custom port services
+        let client_default = ServiceDaemon::new().expect("Failed to create default port client");
+        let browse_default = client_default
+            .browse(service_type)
+            .expect("Failed to browse on default port");
+
+        let mut found_default = false;
+        let mut found_custom_on_default = false;
+
+        while let Ok(event) = browse_default.recv_timeout(timeout) {
+            if let ServiceEvent::ServiceResolved(info) = event {
+                println!(
+                    "Default port client resolved: {} on port {}",
+                    info.get_fullname(),
+                    info.get_port()
+                );
+                if info.get_fullname().starts_with(instance_default) {
+                    found_default = true;
+                    assert_eq!(info.get_port(), 8081);
+                }
+                if info.get_fullname().starts_with(instance_custom) {
+                    found_custom_on_default = true;
+                }
+            }
+        }
+
+        assert!(
+            found_default,
+            "Default port client should find service on default port"
+        );
+        assert!(
+            !found_custom_on_default,
+            "Default port client should NOT find service on custom port"
+        );
+
+        // Cleanup
+        server_custom.shutdown().unwrap();
+        client_custom.shutdown().unwrap();
+        server_default.shutdown().unwrap();
+        client_default.shutdown().unwrap();
+    }
 }
