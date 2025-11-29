@@ -68,7 +68,9 @@ pub const IP_CHECK_INTERVAL_IN_SECS_DEFAULT: u32 = 5;
 /// [RFC 6762 section 10.4](https://datatracker.ietf.org/doc/html/rfc6762#section-10.4)
 pub const VERIFY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 
-const MDNS_PORT: u16 = 5353;
+/// The mDNS port number per RFC 6762.
+pub const MDNS_PORT: u16 = 5353;
+
 const GROUP_ADDR_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const GROUP_ADDR_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const LOOPBACK_V4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -227,9 +229,36 @@ pub struct ServiceDaemon {
 impl ServiceDaemon {
     /// Creates a new daemon and spawns a thread to run the daemon.
     ///
-    /// The daemon (re)uses the default mDNS port 5353. To keep it simple, we don't
-    /// ask callers to set the port.
+    /// Creates a new mDNS service daemon using the default port (5353).
+    ///
+    /// For development/testing with custom ports, use [`ServiceDaemon::new_with_port`].
     pub fn new() -> Result<Self> {
+        Self::new_with_port(MDNS_PORT)
+    }
+
+    /// Creates a new mDNS service daemon using a custom port.
+    ///
+    /// # Arguments
+    ///
+    /// * `port` - The UDP port to bind for mDNS communication.
+    ///   - In production, this should be `MDNS_PORT` (5353) per RFC 6762.
+    ///   - For development/testing, you can use a non-standard port (e.g., 5454)
+    ///     to avoid conflicts with system mDNS services.
+    ///   - Both publisher and browser must use the same port to communicate.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mdns_sd::ServiceDaemon;
+    ///
+    /// // Use standard mDNS port (production)
+    /// let daemon = ServiceDaemon::new_with_port(5353)?;
+    ///
+    /// // Use custom port for development (avoids macOS Bonjour conflict)
+    /// let daemon_dev = ServiceDaemon::new_with_port(5454)?;
+    /// # Ok::<(), mdns_sd::Error>(())
+    /// ```
+    pub fn new_with_port(port: u16) -> Result<Self> {
         // Use port 0 to allow the system assign a random available port,
         // no need for a pre-defined port number.
         let signal_addr = SocketAddrV4::new(LOOPBACK_V4, 0);
@@ -255,7 +284,7 @@ impl ServiceDaemon {
         let mio_sock = MioUdpSocket::from_std(signal_sock);
         thread::Builder::new()
             .name("mDNS_daemon".to_string())
-            .spawn(move || Self::daemon_thread(mio_sock, poller, receiver))
+            .spawn(move || Self::daemon_thread(mio_sock, poller, receiver, port))
             .map_err(|e| e_fmt!("thread builder failed to spawn: {}", e))?;
 
         Ok(Self {
@@ -591,8 +620,8 @@ impl ServiceDaemon {
         self.send_cmd(Command::Verify(instance_fullname, timeout))
     }
 
-    fn daemon_thread(signal_sock: MioUdpSocket, poller: Poll, receiver: Receiver<Command>) {
-        let mut zc = Zeroconf::new(signal_sock, poller);
+    fn daemon_thread(signal_sock: MioUdpSocket, poller: Poll, receiver: Receiver<Command>, port: u16) {
+        let mut zc = Zeroconf::new(signal_sock, poller, port);
 
         if let Some(cmd) = zc.run(receiver) {
             match cmd {
@@ -813,6 +842,10 @@ struct IfSelection {
 
 /// A struct holding the state. It was inspired by `zeroconf` package in Python.
 struct Zeroconf {
+    /// The mDNS port number to use for socket binding.
+    /// Typically MDNS_PORT (5353), but can be customized for development/testing.
+    port: u16,
+
     /// Local interfaces keyed by interface index.
     my_intfs: HashMap<u32, MyIntf>,
 
@@ -915,7 +948,7 @@ fn join_multicast_group(my_sock: &PktInfoUdpSocket, intf: &Interface) -> Result<
 }
 
 impl Zeroconf {
-    fn new(signal_sock: MioUdpSocket, poller: Poll) -> Self {
+    fn new(signal_sock: MioUdpSocket, poller: Poll, port: u16) -> Self {
         // Get interfaces.
         let my_ifaddrs = my_ip_interfaces(true);
 
@@ -928,7 +961,7 @@ impl Zeroconf {
         // Use the same socket for receiving and sending multicast packets.
         // Such socket has to bind to INADDR_ANY or IN6ADDR_ANY.
         let mut ipv4_sock = None;
-        let addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), MDNS_PORT);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), port);
         match new_socket(addr.into(), true) {
             Ok(sock) => {
                 // Per RFC 6762 section 11:
@@ -953,7 +986,7 @@ impl Zeroconf {
         }
 
         let mut ipv6_sock = None;
-        let addr = SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), MDNS_PORT, 0, 0);
+        let addr = SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), port, 0, 0);
         match new_socket(addr.into(), true) {
             Ok(sock) => {
                 // Per RFC 6762 section 11:
@@ -1026,6 +1059,7 @@ impl Zeroconf {
         let status = DaemonStatus::Running;
 
         Self {
+            port,
             my_intfs,
             ipv4_sock,
             ipv6_sock,
@@ -1643,7 +1677,7 @@ impl Zeroconf {
             if service_info.is_addr_auto() {
                 service_info.insert_ipaddr(&intf);
 
-                if announce_service_on_intf(dns_registry, service_info, my_intf, &sock.pktinfo) {
+                if announce_service_on_intf(dns_registry, service_info, my_intf, &sock.pktinfo, self.port) {
                     debug!(
                         "Announce service {} on {}",
                         service_info.get_fullname(),
@@ -1736,7 +1770,7 @@ impl Zeroconf {
 
             // IPv4
             if let Some(sock) = self.ipv4_sock.as_mut() {
-                if announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo) {
+                if announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port) {
                     for addr in intf.addrs.iter().filter(|a| a.ip().is_ipv4()) {
                         outgoing_addrs.push(addr.ip());
                     }
@@ -1752,7 +1786,7 @@ impl Zeroconf {
             }
 
             if let Some(sock) = self.ipv6_sock.as_mut() {
-                if announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo) {
+                if announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port) {
                     for addr in intf.addrs.iter().filter(|a| a.ip().is_ipv6()) {
                         outgoing_addrs.push(addr.ip());
                     }
@@ -1806,10 +1840,10 @@ impl Zeroconf {
             if !out.questions().is_empty() {
                 trace!("sending out probing of questions: {:?}", out.questions());
                 if let Some(sock) = self.ipv4_sock.as_mut() {
-                    send_dns_outgoing(&out, intf, &sock.pktinfo);
+                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port);
                 }
                 if let Some(sock) = self.ipv6_sock.as_mut() {
-                    send_dns_outgoing(&out, intf, &sock.pktinfo);
+                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port);
                 }
             }
 
@@ -1826,12 +1860,12 @@ impl Zeroconf {
                     }
 
                     let announced_v4 = if let Some(sock) = self.ipv4_sock.as_mut() {
-                        announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo)
+                        announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)
                     } else {
                         false
                     };
                     let announced_v6 = if let Some(sock) = self.ipv6_sock.as_mut() {
-                        announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo)
+                        announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)
                     } else {
                         false
                     };
@@ -1947,7 +1981,7 @@ impl Zeroconf {
         }
 
         // `out` data is non-empty, hence we can do this.
-        send_dns_outgoing(&out, intf, sock).remove(0)
+        send_dns_outgoing(&out, intf, sock, self.port).remove(0)
     }
 
     /// Binds a channel `listener` to querying mDNS hostnames.
@@ -1997,10 +2031,10 @@ impl Zeroconf {
 
         for (_, intf) in self.my_intfs.iter() {
             if let Some(sock) = self.ipv4_sock.as_ref() {
-                send_dns_outgoing(&out, intf, &sock.pktinfo);
+                send_dns_outgoing(&out, intf, &sock.pktinfo, self.port);
             }
             if let Some(sock) = self.ipv6_sock.as_ref() {
-                send_dns_outgoing(&out, intf, &sock.pktinfo);
+                send_dns_outgoing(&out, intf, &sock.pktinfo, self.port);
             }
         }
     }
@@ -2841,7 +2875,7 @@ impl Zeroconf {
         if out.answers_count() > 0 {
             debug!("sending response on intf {}", &intf.name);
             out.set_id(msg.id());
-            send_dns_outgoing(&out, intf, &sock.pktinfo);
+            send_dns_outgoing(&out, intf, &sock.pktinfo, self.port);
 
             let if_name = intf.name.clone();
 
@@ -3224,7 +3258,7 @@ impl Zeroconf {
         };
 
         debug!("UnregisterResend from {:?}", if_addr);
-        multicast_on_intf(&packet[..], &intf.name, intf.index, if_addr, &sock.pktinfo);
+        multicast_on_intf(&packet[..], &intf.name, intf.index, if_addr, &sock.pktinfo, self.port);
 
         self.increase_counter(Counter::UnregisterResend, 1);
     }
@@ -3298,12 +3332,12 @@ impl Zeroconf {
         };
 
         let announced_v4 = if let Some(sock) = self.ipv4_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo)
+            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)
         } else {
             false
         };
         let announced_v6 = if let Some(sock) = self.ipv6_sock.as_ref() {
-            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo)
+            announce_service_on_intf(dns_registry, info, intf, &sock.pktinfo, self.port)
         } else {
             false
         };
@@ -3771,7 +3805,7 @@ fn my_ip_interfaces(with_loopback: bool) -> Vec<Interface> {
         .collect()
 }
 
-fn send_dns_outgoing(out: &DnsOutgoing, my_intf: &MyIntf, sock: &PktInfoUdpSocket) -> Vec<Vec<u8>> {
+fn send_dns_outgoing(out: &DnsOutgoing, my_intf: &MyIntf, sock: &PktInfoUdpSocket, port: u16) -> Vec<Vec<u8>> {
     let if_name = &my_intf.name;
 
     let if_addr = if sock.domain() == Domain::IPV4 {
@@ -3786,7 +3820,7 @@ fn send_dns_outgoing(out: &DnsOutgoing, my_intf: &MyIntf, sock: &PktInfoUdpSocke
         }
     };
 
-    send_dns_outgoing_impl(out, if_name, my_intf.index, if_addr, sock)
+    send_dns_outgoing_impl(out, if_name, my_intf.index, if_addr, sock, port)
 }
 
 /// Send an outgoing mDNS query or response, and returns the packet bytes.
@@ -3796,6 +3830,7 @@ fn send_dns_outgoing_impl(
     if_index: u32,
     if_addr: &IfAddr,
     sock: &PktInfoUdpSocket,
+    port: u16,
 ) -> Vec<Vec<u8>> {
     let qtype = if out.is_query() {
         "query"
@@ -3837,7 +3872,7 @@ fn send_dns_outgoing_impl(
 
     let packet_list = out.to_data_on_wire();
     for packet in packet_list.iter() {
-        multicast_on_intf(packet, if_name, if_index, if_addr, sock);
+        multicast_on_intf(packet, if_name, if_index, if_addr, sock, port);
     }
     packet_list
 }
@@ -3849,6 +3884,7 @@ fn multicast_on_intf(
     if_index: u32,
     if_addr: &IfAddr,
     socket: &PktInfoUdpSocket,
+    port: u16,
 ) {
     if packet.len() > MAX_MSG_ABSOLUTE {
         debug!("Drop over-sized packet ({})", packet.len());
@@ -3856,9 +3892,9 @@ fn multicast_on_intf(
     }
 
     let addr: SocketAddr = match if_addr {
-        if_addrs::IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, MDNS_PORT).into(),
+        if_addrs::IfAddr::V4(_) => SocketAddrV4::new(GROUP_ADDR_V4, port).into(),
         if_addrs::IfAddr::V6(_) => {
-            let mut sock = SocketAddrV6::new(GROUP_ADDR_V6, MDNS_PORT, 0, 0);
+            let mut sock = SocketAddrV6::new(GROUP_ADDR_V6, port, 0, 0);
             sock.set_scope_id(if_index); // Choose iface for multicast
             sock.into()
         }
@@ -4048,10 +4084,11 @@ fn announce_service_on_intf(
     info: &ServiceInfo,
     intf: &MyIntf,
     sock: &PktInfoUdpSocket,
+    port: u16,
 ) -> bool {
     let is_ipv4 = sock.domain() == Domain::IPV4;
     if let Some(out) = prepare_announce(info, intf, dns_registry, is_ipv4) {
-        send_dns_outgoing(&out, intf, sock);
+        send_dns_outgoing(&out, intf, sock, port);
         return true;
     }
 
@@ -4462,6 +4499,7 @@ mod tests {
                 intf.index.unwrap_or(0),
                 &intf.addr,
                 &sock.pktinfo,
+                MDNS_PORT,
             );
         }
 
