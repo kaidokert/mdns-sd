@@ -4374,7 +4374,7 @@ mod tests {
     use super::{
         _new_socket_bind, check_domain_suffix, check_service_name_length, hostname_change,
         my_ip_interfaces, name_change, send_dns_outgoing_impl, valid_instance_name,
-        HostnameResolutionEvent, ServiceDaemon, ServiceEvent, ServiceInfo,
+        HostnameResolutionEvent, ServiceDaemon, ServiceEvent, ServiceInfo, MDNS_PORT,
     };
     use crate::{
         dns_parser::{
