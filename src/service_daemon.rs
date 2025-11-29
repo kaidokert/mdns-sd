@@ -620,7 +620,12 @@ impl ServiceDaemon {
         self.send_cmd(Command::Verify(instance_fullname, timeout))
     }
 
-    fn daemon_thread(signal_sock: MioUdpSocket, poller: Poll, receiver: Receiver<Command>, port: u16) {
+    fn daemon_thread(
+        signal_sock: MioUdpSocket,
+        poller: Poll,
+        receiver: Receiver<Command>,
+        port: u16,
+    ) {
         let mut zc = Zeroconf::new(signal_sock, poller, port);
 
         if let Some(cmd) = zc.run(receiver) {
@@ -1677,7 +1682,13 @@ impl Zeroconf {
             if service_info.is_addr_auto() {
                 service_info.insert_ipaddr(&intf);
 
-                if announce_service_on_intf(dns_registry, service_info, my_intf, &sock.pktinfo, self.port) {
+                if announce_service_on_intf(
+                    dns_registry,
+                    service_info,
+                    my_intf,
+                    &sock.pktinfo,
+                    self.port,
+                ) {
                     debug!(
                         "Announce service {} on {}",
                         service_info.get_fullname(),
@@ -3258,7 +3269,14 @@ impl Zeroconf {
         };
 
         debug!("UnregisterResend from {:?}", if_addr);
-        multicast_on_intf(&packet[..], &intf.name, intf.index, if_addr, &sock.pktinfo, self.port);
+        multicast_on_intf(
+            &packet[..],
+            &intf.name,
+            intf.index,
+            if_addr,
+            &sock.pktinfo,
+            self.port,
+        );
 
         self.increase_counter(Counter::UnregisterResend, 1);
     }
@@ -3805,7 +3823,12 @@ fn my_ip_interfaces(with_loopback: bool) -> Vec<Interface> {
         .collect()
 }
 
-fn send_dns_outgoing(out: &DnsOutgoing, my_intf: &MyIntf, sock: &PktInfoUdpSocket, port: u16) -> Vec<Vec<u8>> {
+fn send_dns_outgoing(
+    out: &DnsOutgoing,
+    my_intf: &MyIntf,
+    sock: &PktInfoUdpSocket,
+    port: u16,
+) -> Vec<Vec<u8>> {
     let if_name = &my_intf.name;
 
     let if_addr = if sock.domain() == Domain::IPV4 {
