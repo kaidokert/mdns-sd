@@ -5036,7 +5036,7 @@ mod tests {
             .iter()
             .find(|iface| iface.ip().is_ipv4())
             .map(|iface| iface.ip())
-            .unwrap();
+            .expect("Test requires an IPv4 interface");
 
         // Create service info for custom port (5454)
         let service_custom = ServiceInfo::new(
